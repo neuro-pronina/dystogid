@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>ДистоГид — веб-оценка позы головы/шеи</title>
+<style>
+body{font-family:Arial, sans-serif;margin:0;padding:0;display:flex;flex-direction:column;min-height:100vh;}
+header{background:#333;color:#fff;padding:10px;text-align:center;}
+main{flex:1;display:flex;flex-direction:column;padding:10px;}
+#controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px;}
+#view{display:flex;flex:1;gap:10px;flex-wrap:wrap;}
+#videoContainer{position:relative;}
+#output{position:absolute;left:0;top:0;}
+#info{min-width:250px;font-size:14px;}
+#angles span{display:block;margin-bottom:4px;}
+#patterns,#shift,#twstrs{margin-top:10px;}
+#checklist label{display:block;}
+button{padding:5px 10px;}
+select, input[type=radio]{margin-right:5px;}
+footer{font-size:12px;text-align:center;padding:10px;border-top:1px solid #ccc;}
+@media(max-width:800px){#view{flex-direction:column;}#info{order:-1;}}
+</style>
+<!-- Mediapipe and OpenCV via CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script async src="https://docs.opencv.org/4.x/opencv.js" type="text/javascript"></script>
+</head>
+<body>
+<header>
+<h1>ДистоГид — веб-оценка позы головы/шеи</h1>
+</header>
+<main>
+<div id="controls">
+<label><input type="radio" name="source" value="camera" checked>Камера</label>
+<label><input type="radio" name="source" value="file">Файл видео</label>
+<input type="file" id="videoFile" accept="video/*" style="display:none;" />
+<button id="startBtn">Старт</button>
+<button id="stopBtn" disabled>Стоп</button>
+<button id="resetBtn">Сброс</button>
+<button id="saveBtn" disabled>Сохранить отчёт</button>
+<label>Окно, сек: <select id="windowSelect">
+<option value="5">5</option>
+<option value="10" selected>10</option>
+<option value="15">15</option>
+</select></label>
+<label>Калибровка: <select id="calibSelect">
+<option value="none">нет</option>
+<option value="auto">авто 2 с в начале</option>
+</select></label>
+</div>
+<div id="view">
+<div id="videoContainer">
+<video id="video" playsinline style="transform:scaleX(-1);"></video>
+<canvas id="output"></canvas>
+</div>
+<div id="info">
+<div id="angles">
+<h3>Средние углы (°)</h3>
+<span id="pitch">Pitch: 0</span>
+<span id="roll">Roll: 0</span>
+<span id="yaw">Yaw: 0</span>
+</div>
+<div id="patterns"><h3>Паттерны</h3><div id="patternText">—</div></div>
+<div id="shift"><h3>Шифт</h3><div id="shiftText">нет</div></div>
+<div id="checklist">
+<h3>Клинические ориентиры</h3>
+<label><input type="checkbox" id="eyesLevel">Положение глаз на одном уровне</label>
+<label><input type="checkbox" id="earsVisible">Видны оба уха</label>
+<label><input type="checkbox" id="shouldersLevel">Плечи на одном уровне</label>
+</div>
+<div id="twstrs">
+<h3>TWSTRS I-A (самооценка)</h3>
+<div id="twstrsValues"></div>
+<small>Не заменяет врачебную оценку.</small>
+</div>
+</div>
+</div>
+</main>
+<footer>
+Инструмент для ориентировочной самооценки. Не заменяет врачебный осмотр и официальные шкалы; результаты требуют клинической интерпретации.
+</footer>
+<script>
+const video=document.getElementById('video');
+const canvas=document.getElementById('output');
+const ctx=canvas.getContext('2d');
+let camera=null;let running=false;let useCamera=true;
+let bufferSeconds=10;let fps=30;let calibMode='none';
+let calibFrames=0,calibOffsets={pitch:0,roll:0,yaw:0};
+const buffers={head:{pitch:[],roll:[],yaw:[]},neck:{pitch:[],roll:[],yaw:[]}};
+function clearBuffers(){for(const part in buffers){for(const angle in buffers[part])buffers[part][angle]=[];}}
+function estimateHeadPose(lm){const toDeg=180/Math.PI;const leftEye=lm[33];const rightEye=lm[263];const nose=lm[1];const leftEar=lm[234];const rightEar=lm[454];const chin=lm[152];const midEye={x:(leftEye.x+rightEye.x)/2,y:(leftEye.y+rightEye.y)/2,z:(leftEye.z+rightEye.z)/2};const midEar={x:(leftEar.x+rightEar.x)/2,y:(leftEar.y+rightEar.y)/2,z:(leftEar.z+rightEar.z)/2};const roll=Math.atan2(leftEye.y-rightEye.y,leftEye.x-rightEye.x)*toDeg;const yaw=Math.atan2(nose.x-midEye.x,nose.z-midEye.z)*toDeg;const pitch=Math.atan2(nose.y-midEye.y,nose.z-midEye.z)*toDeg;const shoulderRoll=Math.atan2(leftEar.y-rightEar.y,leftEar.x-rightEar.x)*toDeg;const shoulderYaw=Math.atan2(rightEar.z-leftEar.z,rightEar.x-leftEar.x)*toDeg;const shoulderPitch=Math.atan2(chin.y-midEar.y,chin.z-midEar.z)*toDeg;return{head:{pitch,roll,yaw},neck:{pitch:shoulderPitch,roll:shoulderRoll,yaw:shoulderYaw}};}
+function pushBuffer(data){const maxLen=bufferSeconds*fps;['head','neck'].forEach(part=>{['pitch','roll','yaw'].forEach(angle=>{buffers[part][angle].push(data[part][angle]);if(buffers[part][angle].length>maxLen)buffers[part][angle].shift();});});}
+function computeMeans(){const means={head:{},neck:{}};['head','neck'].forEach(part=>{['pitch','roll','yaw'].forEach(angle=>{const arr=buffers[part][angle];means[part][angle]=arr.reduce((a,b)=>a+b,0)/(arr.length||1);});});return means;}
+function classifyPatterns(means){const res=[];const h=means.head,n=means.neck;function level(v){v=Math.abs(v);if(v<3)return'';if(v<10)return' (лёгкая)';if(v<20)return' (умеренная)';return' (тяжёлая)';}
+function side(val,left,right){return val>0?left:right;}if(Math.abs(n.roll)>=3&&Math.abs(h.roll-n.roll)<3)res.push('латероколлис '+side(n.roll,'влево','вправо')+level(n.roll));if(Math.abs(h.roll)>=3&&Math.abs(h.roll-n.roll)>=3)res.push('латерокапут '+side(h.roll-n.roll,'влево','вправо')+level(h.roll-n.roll));if(Math.abs(n.pitch)>=3&&Math.abs(h.pitch-n.pitch)<3)res.push(side(n.pitch,'антероколлис','ретроколлис')+level(n.pitch));if(Math.abs(h.pitch)>=3&&Math.abs(h.pitch-n.pitch)>=3)res.push(side(h.pitch-n.pitch,'антерокапут','ретрокапут')+level(h.pitch-n.pitch));if(Math.abs(n.yaw)>=3&&Math.abs(h.yaw-n.yaw)<3)res.push('тортиколлис '+side(n.yaw,'влево','вправо')+level(n.yaw));if(Math.abs(h.yaw)>=3&&Math.abs(h.yaw-n.yaw)>=3)res.push('ротация головы '+side(h.yaw-n.yaw,'влево','вправо')+level(h.yaw-n.yaw));return res;}
+function detectShifts(means){const h=means.head,n=means.neck;const diff={roll:h.roll-n.roll,pitch:h.pitch-n.pitch};if(Math.sign(n.roll)!==Math.sign(diff.roll)&&Math.abs(n.roll)>=3&&Math.abs(diff.roll)>=3){return 'латеральное смещение '+(n.roll>0?'влево':'вправо');}if(Math.sign(n.pitch)!==Math.sign(diff.pitch)&&Math.abs(n.pitch)>=3&&Math.abs(diff.pitch)>=3){return n.pitch>0?'сагиттальное смещение вперёд':'сагиттальное смещение назад';}return 'нет';}
+function updateChecklist(means){document.getElementById('eyesLevel').checked=Math.abs(means.head.roll)<3;document.getElementById('earsVisible').checked=Math.abs(means.head.yaw)<20;document.getElementById('shouldersLevel').checked=Math.abs(means.neck.roll)<3;}
+function updateTwstrs(means){const elem=document.getElementById('twstrsValues');const res={};['pitch','roll','yaw'].forEach(a=>{const v=Math.abs(means.head[a]);res[a]=Math.min(100,Math.round(v/30*100));});elem.innerHTML=`<div>Pitch: ${res.pitch}%</div><div>Roll: ${res.roll}%</div><div>Yaw: ${res.yaw}%</div>`;return res;}
+function renderOverlays(results){const img=results.image;canvas.width=img.width;canvas.height=img.height;ctx.save();ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(img,0,0,canvas.width,canvas.height);ctx.strokeStyle='yellow';ctx.lineWidth=2;if(results.multiFaceLandmarks){for(const lm of results.multiFaceLandmarks){ctx.beginPath();ctx.moveTo(lm[33].x*canvas.width,lm[33].y*canvas.height);ctx.lineTo(lm[263].x*canvas.width,lm[263].y*canvas.height);ctx.stroke();ctx.beginPath();ctx.moveTo(lm[234].x*canvas.width,lm[234].y*canvas.height);ctx.lineTo(lm[454].x*canvas.width,lm[454].y*canvas.height);ctx.stroke();}}ctx.restore();}
+function exportReport(means,patterns,shift,twstrs){const data={timestamp:new Date().toISOString(),window_seconds:bufferSeconds,angles_mean_deg:means.head,patterns,shift,twstrs_IA_percent:twstrs,calibration:calibMode,notes:{eyes_level:document.getElementById('eyesLevel').checked?'even':'uneven',both_ears_visible:document.getElementById('earsVisible').checked,shoulders_level:document.getElementById('shouldersLevel').checked}};const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='distogid_report.json';a.click();}
+function onResults(results){if(!running)return;renderOverlays(results);if(results.multiFaceLandmarks){const pose=estimateHeadPose(results.multiFaceLandmarks[0]);if(calibMode==='auto'&&calibFrames<fps*2){calibOffsets.pitch+=pose.head.pitch;calibOffsets.roll+=pose.head.roll;calibOffsets.yaw+=pose.head.yaw;calibFrames++;if(calibFrames===fps*2){calibOffsets.pitch/=calibFrames;calibOffsets.roll/=calibFrames;calibOffsets.yaw/=calibFrames;}}
+pose.head.pitch-=calibOffsets.pitch;pose.head.roll-=calibOffsets.roll;pose.head.yaw-=calibOffsets.yaw;pushBuffer(pose);const means=computeMeans();document.getElementById('pitch').textContent='Pitch: '+means.head.pitch.toFixed(1);document.getElementById('roll').textContent='Roll: '+means.head.roll.toFixed(1);document.getElementById('yaw').textContent='Yaw: '+means.head.yaw.toFixed(1);const patterns=classifyPatterns(means);document.getElementById('patternText').textContent=patterns.length?patterns.join(', '):'—';const shift=detectShifts(means);document.getElementById('shiftText').textContent=shift;updateChecklist(means);currentTwstrs=updateTwstrs(means);}requestAnimationFrame(()=>{if(useCamera){camera&&camera.requestVideoFrameCallback?camera.requestVideoFrameCallback(onFrame):null;}else{onFrame();}});}
+function onFrame(){if(!running)return;if(useCamera){faceMesh.send({image:video});}else{if(video.readyState>=2){faceMesh.send({image:video});}}
+}
+async function start(){clearBuffers();calibFrames=0;calibOffsets={pitch:0,roll:0,yaw:0};bufferSeconds=parseInt(document.getElementById('windowSelect').value);calibMode=document.getElementById('calibSelect').value;running=true;document.getElementById('startBtn').disabled=true;document.getElementById('stopBtn').disabled=false;document.getElementById('saveBtn').disabled=true;await faceMesh.send({image:video});if(useCamera){camera.start();}else{video.play();requestAnimationFrame(onFrame);}}
+function stop(){running=false;if(camera)camera.stop();video.pause();document.getElementById('startBtn').disabled=false;document.getElementById('stopBtn').disabled=true;document.getElementById('saveBtn').disabled=false;}
+function reset(){stop();clearBuffers();document.getElementById('pitch').textContent='Pitch: 0';document.getElementById('roll').textContent='Roll: 0';document.getElementById('yaw').textContent='Yaw: 0';document.getElementById('patternText').textContent='—';document.getElementById('shiftText').textContent='нет';document.getElementById('twstrsValues').innerHTML='';ctx.clearRect(0,0,canvas.width,canvas.height);}const faceMesh=new FaceMesh({locateFile:file=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});faceMesh.setOptions({maxNumFaces:1,refineLandmarks:false,minDetectionConfidence:0.5,minTrackingConfidence:0.5});faceMesh.onResults(onResults);
+function checkHttps(){if(location.protocol!=='https:'&&useCamera){alert('Нужен HTTPS (GitHub Pages/Netlify). Используйте режим «Файл видео».');return false;}return true;}
+document.querySelectorAll('input[name=source]').forEach(r=>r.addEventListener('change',e=>{useCamera=e.target.value==='camera';document.getElementById('videoFile').style.display=useCamera?'none':'block';}));document.getElementById('videoFile').addEventListener('change',e=>{const file=e.target.files[0];if(file){video.src=URL.createObjectURL(file);}});
+startBtn.addEventListener('click',()=>{if(!checkHttps())return;if(useCamera){camera=new Camera(video,{onFrame:onFrame,width:640,height:480});}start();});
+stopBtn.addEventListener('click',stop);
+resetBtn.addEventListener('click',reset);
+saveBtn.addEventListener('click',()=>{const means=computeMeans();const patterns=classifyPatterns(means);const shift=detectShifts(means);const tw=updateTwstrs(means);exportReport(means,patterns,shift,tw);});
+</script>
+</body>
+</html>
